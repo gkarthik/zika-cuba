@@ -31,174 +31,136 @@ travel_incidence <- travel_incidence[rownames(travel_incidence)!="Virgin Islands
 local_incidence <- local_incidence[rownames(local_incidence)!="Virgin Islands (US)",]
 
 sociodem <- read.csv("../data/sociodem.csv", row.names=1)
-meansuit <- read.csv("../data/mean_suitability.csv", row.names = 1)
-sdsuit <- read.csv("../data/mean_suitability.csv", row.names = 1)
+meansuit <- read.csv("../data/mean_suitability.csv", row.names=1)
+sdsuit <- read.csv("../data/sd_suitability.csv", row.names = 1)
+
+colnames(meansuit) <- colnames(travel_incidence)
+colnames(sdsuit) <- colnames(travel_incidence)
+
+## Training Data
+good.rep <- c("Jamaica", "Puerto Rico", "Grenada", "Venezuela", "Trinidad-Tobago")
+tdf <- local_incidence - travel_incidence
+tdf <- tdf[good.rep,]
+tdf <- melt(t(tdf))
+colnames(tdf) <- c("Month", "Country", "delta")
+
+tdf.meansuit <- melt(t(meansuit[good.rep,]))
+colnames(tdf.meansuit) <- c("Month", "Country", "MeanSuit")
+tdf.sdsuit <- melt(t(sdsuit[good.rep,]))
+colnames(tdf.sdsuit) <- c("Month", "Country", "SDSuit")
+
+tdf.sociodem <- sociodem[good.rep,]
+
+tdf <- cbind(tdf, tdf.meansuit[,"MeanSuit"])
+tdf <- cbind(tdf, tdf.sdsuit[,"SDSuit"])
+tdf <- cbind(tdf,tdf.sociodem[tdf[,"Country"],])
+rownames(tdf) <- seq(1:nrow(tdf))
+colnames(tdf) <- c("Month", "Country", "Delta", "MeanSuit", "SDSuit", "PhysiciansPer10000", "HospitalBedPer10000", "GDP", "PopulationDensity")
+
+tdf <- tdf[complete.cases(tdf),]
+
+## Test Data
+bad.rep <- c("Cuba")
+df <- local_incidence - travel_incidence
+df <- df[bad.rep,]
+df <- melt(t(df))
+colnames(df) <- c("Month", "Country", "delta")
+
+df.meansuit <- melt(t(meansuit[bad.rep,]))
+colnames(df.meansuit) <- c("Month", "Country", "MeanSuit")
+df.sdsuit <- melt(t(sdsuit[bad.rep,]))
+colnames(df.sdsuit) <- c("Month", "Country", "SDSuit")
+
+df.sociodem <- sociodem
+df.sociodem[,"Country"] <- rownames(df.sociodem)
+
+df <- merge(df, df.meansuit, by=c("Month", "Country"))
+df <- merge(df, df.sdsuit, by=c("Month", "Country"))
+df <- merge(df, df.sociodem, by="Country")
 
 
-## Plot GDP vs reporting bias
-c <- sapply(rownames(travel_incidence), function(x){
-    cols <- !is.na(travel_incidence[x,]) & !is.na(local_incidence[x,])
-    cor(t(travel_incidence[x,cols]), t(local_incidence[x,cols]), method="spearman")
-})
-c <- c[!is.na(c)]
-df <- data.frame(c, sociodem[names(c), "GDP.PPP"], names(c))
-colnames(df) <- c("Correlation", "GDP", "Name")
-pdf("../plots/gdp_vs_correlation.pdf")
-ggplot(df, aes(x=Correlation, y= GDP, label=Name)) + geom_point() + geom_text(aes(label=Name)) + xlab("Spearman's Rank correlation between travel and local incidence")
-dev.off()
+delta_glm <- glm( delta ~ MeanSuit + SDSuit + Physicians.10.000.people + Hospital.Beds.10.000.people + GDP.PPP + Population.Density, data = df, family="gaussian")
+df <- df[!is.na(df[,"delta"]),]
+df[,"predicted_delta"] <- predict(delta_glm, df)
 
-## Get distribution of local incidence
-t <- unlist(local_incidence)
-t <- t[!is.na(t)]
-pdf("../plots/local_incidence.pdf")
-hist(t)
-dev.off()
-## Follows a log normal dsitribution
+m_norm<-stan(file="regression.stan",data = list())
 
-## Get distribution of travel incidence
-t <- unlist(travel_incidence)
-t <- t[!is.na(t)]
-pdf("../plots/travel_incidence.pdf")
-hist(t)
-dev.off()
-## Follows a log normal dsitribution
+library(rstanarm)
 
+CHAINS <- 4
+CORES <- 6
+SEED <-  112358
 
-pl <- c()
-i <- 1
-for(x in rownames(travel_incidence)){
-    t <- travel_incidence[x,!is.na(travel_incidence[x,])]
-    l <- local_incidence[x,!is.na(local_incidence[x,])]
-    if(length(t) > 0 & length(l) > 0){
-        l <- melt(l)
-        l[,"ID"] <- "Local"
-        t <- melt(t)
-        t[,"ID"] <- "Travel"    
-        d <- rbind(t,l)
-        pl[[i]] <- ggplot(d, aes(x=variable, y=value, color=ID, group=ID)) + geom_point() + geom_line() + theme_bw() + ggtitle(x)
-        i <- i + 1;
-    }    
-}
+delta_bglm <- stan_glm( delta ~ MeanSuit + SDSuit + Physicians.10.000.people + Hospital.Beds.10.000.people + GDP.PPP + Population.Density,
+                              na.action = na.exclude,
+                              data = df,
+                              family = "gaussian",
+                              prior = cauchy(0, 5),
+                              prior_intercept = student_t(df = 7),
+                              chains = CHAINS, cores = CORES, seed = SEED)
 
-n <- length(pl)
-nCol <- floor(sqrt(n))
-pdf("../plots/travel_vs_local.pdf", h = 20, w = 20)
-do.call("grid.arrange", c(pl, ncol=nCol))
-dev.off()
+ci95 <- posterior_interval(delta_bglm, prob = 0.95, pars = "MeanSuit")
+round(ci95, 2)
 
-## Regression
+cbind(Median = coef(delta_bglm), MAD_SD = se(delta_bglm))
 
-library(rstan)
-x <- "Jamaica"
+summary(residuals(delta_bglm)) # not deviance residuals
 
-params <- list()
-i <- 1
-for(x in rownames(travel_incidence)){
-    t <- travel_incidence[x,!is.na(travel_incidence[x,])]
-    l <- local_incidence[x,!is.na(local_incidence[x,])]
-    c <- intersect(colnames(t), colnames(l))
-    la <- NULL
-    if(length(c) > 0){
-        dat <- list(N = length(c),
-                    K = 1,
-                    x = matrix(t[,c]),
-                    y = as.vector(t(l[,c])));    
-        fit <- stan(file = "regression.stan", data = dat, iter = 1000, chains = 4)
-    }
-    params[[i]] <- fit
-    i = i + 1
-}
-saveRDS(params, "params.rds")
+cov2cor(vcov(delta_bglm))
 
-la <- lapply(params, function(x){
-    extract(x, permuted=TRUE)
-})
-saveRDS(la, "la.rds")
+launch_shinystan(delta_bglm)
 
-params <- readRDS("params.rds")
-la <- readRDS("la.rds")
+y_rep <- posterior_predict(delta_bglm)
+dim(y_rep)
 
-pl <- list()
-i <- 1
-for(x in c(1:length(params))){
-    if(x!=match("Cuba", rownames(travel_incidence))){
-        p <- stan_hist(params[[x]], pars="beta") + ggtitle(rownames(travel_incidence)[x])
-        pl[[i]] <- p
-        i <- i+1
-    }
-}
+par(mfrow = 1:2, mar = c(5,3.7,1,0) + 0.1, las = 3)
+boxplot(sweep(y_rep[,womensrole$gender == "Male"], 2, STATS = 
+               womensrole$total[womensrole$gender == "Male"], FUN = "/"), 
+        axes = FALSE, main = "Male", pch = NA,
+        xlab = "Years of Education", ylab = "Proportion of Agrees")
+with(womensrole, axis(1, at = education[gender == "Male"] + 1, 
+                      labels = 0:20))
+axis(2, las = 1)
+with(womensrole[womensrole$gender == "Male",], 
+     points(education + 1,  agree / (agree + disagree), 
+            pch = 16, col = "red"))
+boxplot(sweep(y_rep[,womensrole$gender == "Female"], 2, STATS = 
+          womensrole$total[womensrole$gender == "Female"], FUN = "/"), 
+          axes = FALSE, main = "Female", pch = NA,
+        xlab = "Years of Education", ylab = "")
+with(womensrole, axis(1, at = education[gender == "Female"] + 1,
+     labels = 0:20))
+with(womensrole[womensrole$gender == "Female",], 
+     points(education + 1,  agree / (agree + disagree), 
+            pch = 16, col = "red"))
 
-n <- length(pl)
-nCol <- floor(sqrt(n))
-pdf("../plots/beta.pdf", h = 20, w = 20)
-do.call("grid.arrange", c(pl, ncol=nCol))
-dev.off()
+(womensrole_bglm_2 <- update(delta_bglm, formula. = . ~ . + I(education^2)))
 
-pl <- list()
-i <- 1
-for(x in c(1:length(params))){
-    if(x!=match("Cuba", rownames(travel_incidence))){
-        p <- stan_hist(params[[x]], pars="alpha") + ggtitle(rownames(travel_incidence)[x])
-        pl[[i]] <- p
-        i <- i+1
-    }
-}
+loo_bglm_1 <- loo(delta_bglm)
+loo_bglm_2 <- loo(womensrole_bglm_2)
 
-n <- length(pl)
-nCol <- floor(sqrt(n))
-pdf("../plots/alpha.pdf", h = 20, w = 20)
-do.call("grid.arrange", c(pl, ncol=nCol))
-dev.off()
+par(mfrow = 1:2, mar = c(5,3.8,1,0) + 0.1, las = 3)
+plot(loo_bglm_1, label_points = TRUE)
+plot(loo_bglm_2, label_points = TRUE)
 
+compare_models(loo_bglm_1, loo_bglm_2)
 
-beta <- sapply(la[-match("Cuba", rownames(travel_incidence))], function(x){
-    x$beta
-});
+loo_bglm_1
 
-alpha <- sapply(la[-match("Cuba", rownames(travel_incidence))], function(x){
-    x$alpha
-});
+# note: in newdata we want agree and disgree to sum to the number of people we
+# want to predict for. the values of agree and disagree don't matter so long as
+# their sum is the desired number of trials. we need to explicitly imply the
+# number of trials like this because our original data are aggregate. if we had
+# bernoulli data then it would be a given we wanted to predict for single
+# individuals.
+newdata <- data.frame(agree = c(0,0), disagree = c(100,100), education = c(12,16),
+                      gender = factor("Female", levels = c("Male", "Female")))
+y_rep <- posterior_predict(womensrole_bglm_2, newdata)
+summary(apply(y_rep, 1, diff))
 
-hist(beta)
-hist(alpha)
+bad_rhat <- stan_glm(mpg ~ ., data = mtcars, iter = 20, 
+                     chains = CHAINS, cores = CORES, seed = SEED)
 
-
-t.all <- lapply(rownames(travel_incidence), function(x){
-    print(x)
-    t <- travel_incidence[x,!(is.na(travel_incidence[x,]) | travel_incidence[x,] == Inf)]
-    l <- local_incidence[x,!(is.na(local_incidence[x,]) | local_incidence[x,] == Inf)]
-    c <- intersect(colnames(t), colnames(l))
-    if(length(c) > 0){
-        as.vector(t(t[,c]))
-    } else {
-        NULL
-    }
-});
-t.all <- unlist(t.all)
-
-l.all <- lapply(rownames(travel_incidence), function(x){
-    print(x)
-    t <- travel_incidence[x,!(is.na(travel_incidence[x,]) | travel_incidence[x,] == Inf)]
-    l <- local_incidence[x,!(is.na(local_incidence[x,]) | local_incidence[x,] == Inf)]
-    c <- intersect(colnames(t), colnames(l))
-    if(length(c) > 0){
-        as.vector(t(l[,c]))
-    } else {
-        NULL
-    }
-});
-l.all <- unlist(l.all)
-
-dat <- list(N = length(l.all),
-            x = t.all,
-            y = l.all);
-fit <- stan(file = "regression.stan", data = dat, iter = 20000, chains = 4)
-print(fit)
-stan_trace(fit)
-stan_plot(fit)
-stan_hist(fit)
-
-ex <- sapply(t.all, function(x){
-    length(x) > 0
-})
+rhat <- summary(bad_rhat)[, "Rhat"]
+rhat[rhat > 1.1]
 
